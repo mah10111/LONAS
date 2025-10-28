@@ -4,7 +4,6 @@ import copy
 import json
 import logging
 import os
-import re
 import sys
 from dataclasses import dataclass, field
 from typing import Optional
@@ -14,12 +13,9 @@ import torch
 import transformers
 from datasets import load_dataset
 from peft import LoraConfig, PeftModel, get_peft_model
-from peft.tuners.lora import unwrap_peft
-# from peft import LoraConfig, PeftModel, get_peft_model, unwrap_peft
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    GenerationConfig,
     HfArgumentParser,
     Trainer,
     TrainingArguments,
@@ -29,17 +25,18 @@ from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
 
 from nncf import NNCFConfig
-from nncf.experimental.torch.nas.bootstrapNAS.elasticity.elasticity_dim import ElasticityDim
 from nncf.experimental.torch.nas.bootstrapNAS.training.model_creator_helpers import (
     create_compressed_model_from_algo_names,
 )
-from nncf.experimental.torch.nas.bootstrapNAS import BaseSearchAlgorithm
 from nncf.torch.model_creation import create_nncf_network
 
 check_min_version("4.31.0")
 logger = logging.getLogger(__name__)
 TEST_DATASETS = ["boolq", "piqa", "social_i_qa", "winogrande", "ARC-Easy", "ARC-Challenge", "openbookqa", "hellaswag"]
 
+# ----------------------------
+# Dataclasses
+# ----------------------------
 @dataclass
 class LonasTrainingArguments(TrainingArguments):
     nncf_config: Optional[str] = field(default=None, metadata={"help": "Path to NNCF config file for NAS/quantization"})
@@ -79,6 +76,9 @@ class ModelArguments:
     use_auth_token: bool = field(default=False)
     ignore_mismatched_sizes: bool = field(default=False)
 
+# ----------------------------
+# Main
+# ----------------------------
 def main():
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, LonasTrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
@@ -109,7 +109,7 @@ def main():
     set_seed(training_args.seed)
 
     # ----------------------------
-    # 1) Load base model (without LoRA)
+    # 1) Load base model
     # ----------------------------
     model = AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
@@ -121,39 +121,25 @@ def main():
     )
 
     # ----------------------------
-    # 2) Prepare nncf_config
+    # 2) Prepare NNCF
     # ----------------------------
-    nncf_config = None
+    compression_ctrl = None
     if training_args.nncf_config:
         nncf_config = NNCFConfig.from_json(training_args.nncf_config)
         if nncf_config.get("log_dir") is None:
             nncf_config["log_dir"] = training_args.output_dir
         os.makedirs(nncf_config["log_dir"], exist_ok=True)
 
-    # ----------------------------
-    # 3) Apply NNCF BEFORE adding LoRA
-    # ----------------------------
-    compression_ctrl = None
-    if nncf_config:
-        logger.info("Applying NNCF/BootstrapNAS on base model...")
-        nncf_network = unwrap_peft(model)  # unwrap PEFT if present
+        nncf_network = model.base_model if hasattr(model, "base_model") else model
         nncf_network = create_nncf_network(nncf_network, nncf_config)
         algo_name = nncf_config.get("bootstrapNAS", {}).get("training", {}).get("algorithm", "progressive_shrinking")
         compression_ctrl, model = create_compressed_model_from_algo_names(nncf_network, nncf_config, algo_names=[algo_name])
 
-        # Debug print modules after NNCF
-        print("=== module names containing 'proj' after NNCF ===")
-        for n, m in model.named_modules():
-            if any(k in n for k in ['q_proj', 'k_proj', 'v_proj']):
-                print(n, type(m))
-        print("=== end module list ===")
-
     # ----------------------------
-    # 4) Apply LoRA (after NNCF)
+    # 3) Apply LoRA
     # ----------------------------
     if training_args.lora:
         if model_args.lora_weights is None:
-            logger.info("Adding LoRA modules...")
             lora_config = LoraConfig(
                 r=training_args.lora_r,
                 lora_alpha=training_args.lora_alpha,
@@ -165,17 +151,95 @@ def main():
             model = get_peft_model(model, lora_config)
             model.print_trainable_parameters()
         else:
-            logger.info("Loading LoRA modules...")
             model = PeftModel.from_pretrained(model, model_args.lora_weights, torch_dtype=torch.float16, device_map="auto")
 
     # ----------------------------
-    # 5) Tokenizer
+    # 4) Tokenizer
     # ----------------------------
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, cache_dir=model_args.cache_dir)
     tokenizer.pad_token_id = 0
     tokenizer.padding_side = "left"
 
-    # ... ادامه pipeline دیتا و Trainer دقیقا مثل کد اصلی شما ...
+    # ----------------------------
+    # 5) Dataset
+    # ----------------------------
+    def tokenize(prompt, add_eos_token=True):
+        result = tokenizer(prompt, truncation=True, max_length=data_args.cutoff_len, padding=True, return_tensors=None)
+        if result["input_ids"][-1] != tokenizer.eos_token_id and len(result["input_ids"]) < data_args.cutoff_len and add_eos_token:
+            result["input_ids"].append(tokenizer.eos_token_id)
+            result["attention_mask"].append(1)
+        result["labels"] = result["input_ids"].copy()
+        return result
+
+    def generate_prompt(data_point):
+        if data_point.get("input"):
+            return f"Below is an instruction that describes a task, paired with an input.\n\n### Instruction:\n{data_point['instruction']}\n\n### Input:\n{data_point['input']}\n\n### Response:\n{data_point['output']}"
+        else:
+            return f"Below is an instruction that describes a task.\n\n### Instruction:\n{data_point['instruction']}\n\n### Response:\n{data_point['output']}"
+
+    def generate_and_tokenize_prompt(data_point):
+        full_prompt = generate_prompt(data_point)
+        tokenized_full_prompt = tokenize(full_prompt)
+        if not training_args.train_on_inputs:
+            user_prompt = generate_prompt({**data_point, "output": ""})
+            tokenized_user_prompt = tokenize(user_prompt, add_eos_token=False)
+            user_prompt_len = len(tokenized_user_prompt["input_ids"])
+            tokenized_full_prompt["labels"] = [-100]*user_prompt_len + tokenized_full_prompt["labels"][user_prompt_len:]
+        return tokenized_full_prompt
+
+    train_dataset, eval_dataset = None, None
+    if training_args.do_train:
+        data = load_dataset("json", data_files=data_args.dataset_path)
+        val_set_size = data_args.val_set_size
+        if val_set_size > 0:
+            train_val = data["train"].train_test_split(test_size=val_set_size, shuffle=True, seed=42)
+            train_dataset = train_val["train"].shuffle().map(generate_and_tokenize_prompt)
+            eval_dataset = train_val["test"].shuffle().map(generate_and_tokenize_prompt)
+        else:
+            train_dataset = data["train"].shuffle().map(generate_and_tokenize_prompt)
+
+    # ----------------------------
+    # 6) Trainer
+    # ----------------------------
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset if training_args.do_train else None,
+        eval_dataset=eval_dataset if training_args.do_eval else None,
+        data_collator=transformers.DataCollatorForSeq2Seq(tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True),
+        compression_ctrl=compression_ctrl,
+    )
+
+    model.config.use_cache = False
+
+    # ----------------------------
+    # 7) Training
+    # ----------------------------
+    if training_args.do_train:
+        checkpoint = training_args.resume_from_checkpoint if training_args.resume_from_checkpoint else last_checkpoint
+        train_result = trainer.train(resume_from_checkpoint=checkpoint)
+        metrics = train_result.metrics
+        max_train_samples = data_args.max_train_samples if data_args.max_train_samples else len(train_dataset)
+        metrics["train_samples"] = min(max_train_samples, len(train_dataset))
+        trainer.save_model()
+        trainer.log_metrics("train", metrics)
+        trainer.save_metrics("train", metrics)
+        trainer.save_state()
+
+    # ----------------------------
+    # 8) Evaluation / Prediction
+    # ----------------------------
+    if training_args.do_eval:
+        metrics = trainer.evaluate()
+        trainer.log_metrics("eval", metrics)
+        trainer.save_metrics("eval", metrics)
+
+    if training_args.do_predict and data_args.test_file:
+        test_data = load_dataset("json", data_files={"test": data_args.test_file})
+        test_dataset = test_data["test"].map(generate_and_tokenize_prompt)
+        predictions = trainer.predict(test_dataset)
+        trainer.log_metrics("predict", predictions.metrics)
+        trainer.save_metrics("predict", predictions.metrics)
 
 if __name__ == "__main__":
     main()
