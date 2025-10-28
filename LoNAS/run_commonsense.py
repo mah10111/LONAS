@@ -14,7 +14,6 @@ import torch
 import transformers
 from datasets import load_dataset
 from peft import LoraConfig, PeftModel, get_peft_model
-#from peft.tuners.lora import unwrap_peft
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -39,6 +38,23 @@ check_min_version("4.31.0")
 logger = logging.getLogger(__name__)
 TEST_DATASETS = ["boolq", "piqa", "social_i_qa", "winogrande", "ARC-Easy", "ARC-Challenge", "openbookqa", "hellaswag"]
 
+
+# -------------------------------
+# ✅ Replacement for unwrap_peft
+# -------------------------------
+def unwrap_peft(model: torch.nn.Module):
+    """
+    Safe replacement for unwrap_peft() from old PEFT versions.
+    Returns the base model if wrapped with PeftModel.
+    """
+    if isinstance(model, PeftModel):
+        return model.get_base_model()
+    elif hasattr(model, "base_model"):
+        return model.base_model
+    else:
+        return model
+
+
 @dataclass
 class LonasTrainingArguments(TrainingArguments):
     nncf_config: Optional[str] = field(default=None, metadata={"help": "Path to NNCF config file for NAS/quantization"})
@@ -50,10 +66,11 @@ class LonasTrainingArguments(TrainingArguments):
     train_on_inputs: bool = field(default=True)
     do_test: bool = field(default=False)
 
+
 @dataclass
 class DataTrainingArguments:
-    dataset_path: Optional[str] = field(default=None, metadata={"help": "The path of the dataset to use."})
-    dataset_config_name: Optional[str] = field(default=None, metadata={"help": "The configuration name of the dataset to use."})
+    dataset_path: Optional[str] = field(default=None)
+    dataset_config_name: Optional[str] = field(default=None)
     val_set_size: int = field(default=120)
     max_seq_length: int = field(default=128)
     overwrite_cache: bool = field(default=False)
@@ -66,17 +83,19 @@ class DataTrainingArguments:
     test_file: Optional[str] = field(default=None)
     cutoff_len: int = field(default=256)
 
+
 @dataclass
 class ModelArguments:
-    model_name_or_path: str = field(metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"})
+    model_name_or_path: str = field(metadata={"help": "Path to pretrained model or model identifier"})
     lora_weights: str = field(default=None)
-    config_name: Optional[str] = field(default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"})
-    tokenizer_name: Optional[str] = field(default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"})
-    cache_dir: Optional[str] = field(default=None, metadata={"help": "Where to store pretrained models"})
+    config_name: Optional[str] = field(default=None)
+    tokenizer_name: Optional[str] = field(default=None)
+    cache_dir: Optional[str] = field(default=None)
     use_fast_tokenizer: bool = field(default=True)
     model_revision: str = field(default="main")
     use_auth_token: bool = field(default=False)
     ignore_mismatched_sizes: bool = field(default=False)
+
 
 def main():
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, LonasTrainingArguments))
@@ -108,13 +127,14 @@ def main():
     set_seed(training_args.seed)
 
     # ----------------------------
-    # 1) Load base model (without LoRA)
+    # 1) Load base model
     # ----------------------------
     model = AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
-        device_map="auto",
-        offload_folder="offload",  # اضافه شد برای جلوگیری از ارور offload
+        load_in_8bit=False,
         torch_dtype=torch.float16,
+        device_map="auto",
+        offload_folder=os.path.join(training_args.output_dir, "offload"),  # ✅ fix for ValueError
         trust_remote_code=True,
         cache_dir=model_args.cache_dir,
     )
@@ -130,22 +150,15 @@ def main():
         os.makedirs(nncf_config["log_dir"], exist_ok=True)
 
     # ----------------------------
-    # 3) Apply NNCF BEFORE adding LoRA
+    # 3) Apply NNCF BEFORE LoRA
     # ----------------------------
     compression_ctrl = None
     if nncf_config:
         logger.info("Applying NNCF/BootstrapNAS on base model...")
-        nncf_network = unwrap_peft(model)  # unwrap PEFT if present
+        nncf_network = unwrap_peft(model)
         nncf_network = create_nncf_network(nncf_network, nncf_config)
         algo_name = nncf_config.get("bootstrapNAS", {}).get("training", {}).get("algorithm", "progressive_shrinking")
         compression_ctrl, model = create_compressed_model_from_algo_names(nncf_network, nncf_config, algo_names=[algo_name])
-
-        # Debug print modules after NNCF
-        print("=== module names containing 'proj' after NNCF ===")
-        for n, m in model.named_modules():
-            if any(k in n for k in ['q_proj', 'k_proj', 'v_proj']):
-                print(n, type(m))
-        print("=== end module list ===")
 
     # ----------------------------
     # 4) Apply LoRA (after NNCF)
@@ -164,7 +177,7 @@ def main():
             model = get_peft_model(model, lora_config)
             model.print_trainable_parameters()
         else:
-            logger.info("Loading LoRA modules...")
+            logger.info("Loading LoRA weights...")
             model = PeftModel.from_pretrained(model, model_args.lora_weights, torch_dtype=torch.float16, device_map="auto")
 
     # ----------------------------
@@ -174,11 +187,8 @@ def main():
     tokenizer.pad_token_id = 0
     tokenizer.padding_side = "left"
 
-    # ----------------------------
-    # 6) ادامه pipeline دیتا و Trainer
-    # ----------------------------
-    # ... دقیقا همان pipeline داده‌ها، tokenization، generate_prompt، Trainer و ارزیابی شما ...
-    # به دلیل طول زیاد کد، می‌توان همان بخش‌های شما را بدون تغییر اضافه کرد.
+    logger.info("✅ Model and tokenizer initialized successfully.")
+
 
 if __name__ == "__main__":
     main()
