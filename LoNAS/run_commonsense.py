@@ -43,8 +43,8 @@ TEST_DATASETS = ["boolq", "piqa", "social_i_qa", "winogrande", "ARC-Easy", "ARC-
 @dataclass
 class LonasTrainingArguments(TrainingArguments):
     nncf_config: Optional[str] = field(
-    default=None,
-    metadata={"help": "Path to NNCF config file for NAS/quantization"}
+        default=None,
+        metadata={"help": "Path to NNCF config file for NAS/quantization"},
     )
     lora_r: int = field(default=32, metadata={"help": "Lora R dimension."})
     lora_alpha: float = field(default=64, metadata={"help": " Lora alpha."})
@@ -223,7 +223,9 @@ def main():
     # Set seed before initializing model.
     set_seed(training_args.seed)
 
-    # load model
+    # ----------------------------
+    # 1) load base model (without LoRA yet)
+    # ----------------------------
     model = AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         load_in_8bit=False,
@@ -233,22 +235,9 @@ def main():
         cache_dir=model_args.cache_dir,
     )
 
-    if training_args.lora and model_args.lora_weights is None:
-        logger.info("adding LoRA modules...")
-        config = LoraConfig(
-            r=training_args.lora_r,
-            lora_alpha=training_args.lora_alpha,
-            lora_dropout=training_args.lora_dropout,
-            target_modules=training_args.target_modules.split(","),
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-        model = get_peft_model(model, config)
-        model.print_trainable_parameters()
-    elif training_args.lora:
-        logger.info("Loading LoRA modules...")
-        model = PeftModel.from_pretrained(model, model_args.lora_weights, torch_dtype=torch.float16, device_map="auto")
-
+    # ----------------------------
+    # 2) prepare nncf_config (if provided)
+    # ----------------------------
     nncf_config = None
     if training_args.nncf_config is not None:
         nncf_config = NNCFConfig.from_json(training_args.nncf_config)
@@ -259,13 +248,47 @@ def main():
         if not os.path.exists(training_args.output_dir) and training_args.local_rank in [-1, 0]:
             os.makedirs(nncf_config["log_dir"])
 
+    # ----------------------------
+    # 3) Apply NNCF/BootstrapNAS BEFORE adding LoRA
+    # ----------------------------
     compression_ctrl = None
     if nncf_config is not None:
+        logger.info("Creating NNCF network and applying compression (BootstrapNAS/NNCF) on base model...")
         nncf_network = create_nncf_network(model, nncf_config)
         algo_name = nncf_config.get("bootstrapNAS", {}).get("training", {}).get("algorithm", "progressive_shrinking")
         compression_ctrl, model = create_compressed_model_from_algo_names(
             nncf_network, nncf_config, algo_names=[algo_name]
         )
+
+        # Debug: print relevant module names after NNCF wrapping to help align nncf_config target_modules
+        try:
+            print("=== module names containing 'gate' or 'proj' (after NNCF) ===")
+            for n, m in model.named_modules():
+                if any(k in n for k in ['gate', 'proj', 'q_proj', 'k_proj', 'v_proj', 'up_proj', 'down_proj']):
+                    print(n, type(m))
+            print("=== end module list ===")
+        except Exception as e:
+            logger.warning(f"Failed to print module names for debug: {e}")
+
+    # ----------------------------
+    # 4) Now add LoRA (either new or load existing) on the model AFTER NNCF wrapping
+    # ----------------------------
+    if training_args.lora:
+        if model_args.lora_weights is None:
+            logger.info("adding LoRA modules (after NNCF if present)...")
+            config = LoraConfig(
+                r=training_args.lora_r,
+                lora_alpha=training_args.lora_alpha,
+                lora_dropout=training_args.lora_dropout,
+                target_modules=training_args.target_modules.split(","),
+                bias="none",
+                task_type="CAUSAL_LM",
+            )
+            model = get_peft_model(model, config)
+            model.print_trainable_parameters()
+        else:
+            logger.info("Loading LoRA modules (after NNCF if present)...")
+            model = PeftModel.from_pretrained(model, model_args.lora_weights, torch_dtype=torch.float16, device_map="auto")
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, cache_dir=model_args.cache_dir)
