@@ -14,7 +14,7 @@ import torch
 import transformers
 from datasets import load_dataset
 from peft import LoraConfig, PeftModel, get_peft_model
-from peft.tuners.lora import unwrap_peft
+#from peft.tuners.lora import unwrap_peft
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
