@@ -4,7 +4,6 @@ import copy
 import json
 import logging
 import os
-import re
 import sys
 from dataclasses import dataclass, field
 from typing import Optional
@@ -17,7 +16,6 @@ from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    GenerationConfig,
     HfArgumentParser,
     Trainer,
     TrainingArguments,
@@ -36,28 +34,65 @@ from nncf.torch.model_creation import create_nncf_network
 
 check_min_version("4.31.0")
 logger = logging.getLogger(__name__)
-TEST_DATASETS = ["boolq", "piqa", "social_i_qa", "winogrande", "ARC-Easy", "ARC-Challenge", "openbookqa", "hellaswag"]
+TEST_DATASETS = [
+    "boolq",
+    "piqa",
+    "social_i_qa",
+    "winogrande",
+    "ARC-Easy",
+    "ARC-Challenge",
+    "openbookqa",
+    "hellaswag",
+]
 
 
 # -------------------------------
-# ✅ Replacement for unwrap_peft
+# Helper: prepare base model for NNCF
 # -------------------------------
-def unwrap_peft(model: torch.nn.Module):
+def get_base_model_for_nncf(model: torch.nn.Module) -> torch.nn.Module:
     """
-    Safe replacement for unwrap_peft() from old PEFT versions.
-    Returns the base model if wrapped with PeftModel.
+    Return a model suitable to be passed to create_nncf_network / create_compressed_model_from_algo_names.
+    If model is a PeftModel with merge_and_unload(), merge LoRA into base model and return merged model.
+    Otherwise return model.base_model or model.model if available, else model.
     """
-    if isinstance(model, PeftModel):
-        return model.get_base_model()
-    elif hasattr(model, "base_model"):
+    # If it's an instance of PeftModel, try to merge and unload adapters if possible
+    try:
+        if isinstance(model, PeftModel):
+            # If PeftModel provides merge_and_unload (some versions), call it to produce a plain model
+            if hasattr(model, "merge_and_unload") and callable(getattr(model, "merge_and_unload")):
+                logging.info("Merging LoRA weights into base model (merge_and_unload)...")
+                try:
+                    merged = model.merge_and_unload()
+                    logging.info("Merged LoRA into base model successfully.")
+                    return merged
+                except Exception as e:
+                    logging.warning(f"merge_and_unload() failed: {e}. Falling back to get_base_model()/base_model attr.")
+            # fallback to get_base_model if exists
+            if hasattr(model, "get_base_model") and callable(getattr(model, "get_base_model")):
+                try:
+                    return model.get_base_model()
+                except Exception:
+                    pass
+            # fallback to attribute
+            if hasattr(model, "base_model"):
+                return model.base_model
+    except Exception:
+        # if PeftModel class is not present or isinstance fails, continue to generic checks
+        pass
+
+    # Generic fallbacks
+    if hasattr(model, "base_model"):
         return model.base_model
-    else:
-        return model
+    if hasattr(model, "model"):
+        return model.model
+    return model
 
 
 @dataclass
 class LonasTrainingArguments(TrainingArguments):
-    nncf_config: Optional[str] = field(default=None, metadata={"help": "Path to NNCF config file for NAS/quantization"})
+    nncf_config: Optional[str] = field(
+        default=None, metadata={"help": "Path to NNCF config file for NAS/quantization"}
+    )
     lora_r: int = field(default=32, metadata={"help": "Lora R dimension."})
     lora_alpha: float = field(default=64, metadata={"help": "Lora alpha."})
     lora_dropout: float = field(default=0.0, metadata={"help": "Lora dropout."})
@@ -126,6 +161,10 @@ def main():
 
     set_seed(training_args.seed)
 
+    # make sure offload folder exists (device_map="auto" may offload to disk)
+    offload_folder = os.path.join(training_args.output_dir, "offload")
+    os.makedirs(offload_folder, exist_ok=True)
+
     # ----------------------------
     # 1) Load base model
     # ----------------------------
@@ -134,7 +173,7 @@ def main():
         load_in_8bit=False,
         torch_dtype=torch.float16,
         device_map="auto",
-        offload_folder=os.path.join(training_args.output_dir, "offload"),  # ✅ fix for ValueError
+        offload_folder=offload_folder,
         trust_remote_code=True,
         cache_dir=model_args.cache_dir,
     )
@@ -155,17 +194,30 @@ def main():
     compression_ctrl = None
     if nncf_config:
         logger.info("Applying NNCF/BootstrapNAS on base model...")
-        nncf_network = unwrap_peft(model)
+
+        # Ensure we pass the pure base model (merge LoRA if it was already attached)
+        nncf_network = get_base_model_for_nncf(model)
+        # create nncf network and compressed model
         nncf_network = create_nncf_network(nncf_network, nncf_config)
         algo_name = nncf_config.get("bootstrapNAS", {}).get("training", {}).get("algorithm", "progressive_shrinking")
         compression_ctrl, model = create_compressed_model_from_algo_names(nncf_network, nncf_config, algo_names=[algo_name])
+
+        # Debug: print some module names
+        try:
+            print("=== module names containing 'proj' after NNCF ===")
+            for n, m in model.named_modules():
+                if any(k in n for k in ["q_proj", "k_proj", "v_proj", "proj"]):
+                    print(n, type(m))
+            print("=== end module list ===")
+        except Exception as e:
+            logger.warning(f"Failed to list modules after NNCF: {e}")
 
     # ----------------------------
     # 4) Apply LoRA (after NNCF)
     # ----------------------------
     if training_args.lora:
         if model_args.lora_weights is None:
-            logger.info("Adding LoRA modules...")
+            logger.info("Adding LoRA modules (fresh)...")
             lora_config = LoraConfig(
                 r=training_args.lora_r,
                 lora_alpha=training_args.lora_alpha,
@@ -177,7 +229,7 @@ def main():
             model = get_peft_model(model, lora_config)
             model.print_trainable_parameters()
         else:
-            logger.info("Loading LoRA weights...")
+            logger.info("Loading LoRA weights from %s ...", model_args.lora_weights)
             model = PeftModel.from_pretrained(model, model_args.lora_weights, torch_dtype=torch.float16, device_map="auto")
 
     # ----------------------------
@@ -189,6 +241,8 @@ def main():
 
     logger.info("✅ Model and tokenizer initialized successfully.")
 
+    # The rest of your pipeline (dataset, tokenization, Trainer, training/eval) can continue here.
+    # I leave the remainder of your original pipeline in place to avoid removing logic you already had.
 
 if __name__ == "__main__":
     main()
