@@ -4,6 +4,7 @@ import copy
 import json
 import logging
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from typing import Optional
@@ -16,6 +17,7 @@ from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    GenerationConfig,
     HfArgumentParser,
     Trainer,
     TrainingArguments,
@@ -45,54 +47,119 @@ TEST_DATASETS = [
     "hellaswag",
 ]
 
+# -------------------------------
+# Helper: aggressive unwrap & merge
+# -------------------------------
+def contains_lora_modules(mod: torch.nn.Module) -> bool:
+    """Detect Lora modules by name/repr heuristics."""
+    for name, module in mod.named_modules():
+        lname = name.lower()
+        if "lora" in lname or "lora_" in lname or "loramodule" in lname:
+            return True
+        try:
+            rep = repr(module)
+            if "ModuleDict" in rep and "lora" in rep:
+                return True
+        except Exception:
+            pass
+    return False
 
-# -------------------------------
-# Helper: prepare base model for NNCF
-# -------------------------------
-def get_base_model_for_nncf(model: torch.nn.Module) -> torch.nn.Module:
+
+def get_base_model_for_nncf_aggressive(model: torch.nn.Module, model_args, offload_folder: str):
     """
-    Return a model suitable to be passed to create_nncf_network / create_compressed_model_from_algo_names.
-    If model is a PeftModel with merge_and_unload(), merge LoRA into base model and return merged model.
-    Otherwise return model.base_model or model.model if available, else model.
+    Aggressive extraction of a clean base model for NNCF:
+    - tries merge_and_unload if PeftModel
+    - falls back to get_base_model / base_model / model attributes
+    - if lora modules still detected, reload fresh base from model_args.model_name_or_path
+      and (optionally) attach+merge model_args.lora_weights
+    Returns the clean model suitable for create_nncf_network.
     """
-    # If it's an instance of PeftModel, try to merge and unload adapters if possible
+    nncf_candidate = model
     try:
-        if isinstance(model, PeftModel):
-            # If PeftModel provides merge_and_unload (some versions), call it to produce a plain model
-            if hasattr(model, "merge_and_unload") and callable(getattr(model, "merge_and_unload")):
-                logging.info("Merging LoRA weights into base model (merge_and_unload)...")
-                try:
-                    merged = model.merge_and_unload()
-                    logging.info("Merged LoRA into base model successfully.")
-                    return merged
-                except Exception as e:
-                    logging.warning(f"merge_and_unload() failed: {e}. Falling back to get_base_model()/base_model attr.")
-            # fallback to get_base_model if exists
-            if hasattr(model, "get_base_model") and callable(getattr(model, "get_base_model")):
-                try:
-                    return model.get_base_model()
-                except Exception:
-                    pass
-            # fallback to attribute
-            if hasattr(model, "base_model"):
-                return model.base_model
-    except Exception:
-        # if PeftModel class is not present or isinstance fails, continue to generic checks
-        pass
+        unwrap_attempts = 0
+        while True:
+            if isinstance(nncf_candidate, PeftModel):
+                # try merge_and_unload
+                if hasattr(nncf_candidate, "merge_and_unload") and callable(getattr(nncf_candidate, "merge_and_unload")):
+                    try:
+                        logger.info("Detected PeftModel: calling merge_and_unload() (attempt %d)...", unwrap_attempts + 1)
+                        merged = nncf_candidate.merge_and_unload()
+                        nncf_candidate = merged
+                        logger.info("merge_and_unload succeeded.")
+                        unwrap_attempts += 1
+                        continue
+                    except Exception as e:
+                        logger.warning("merge_and_unload failed: %s — falling back to base_model/get_base_model", e)
+                # fallback get_base_model or attribute
+                if hasattr(nncf_candidate, "get_base_model") and callable(getattr(nncf_candidate, "get_base_model")):
+                    try:
+                        nncf_candidate = nncf_candidate.get_base_model()
+                        logger.info("Used get_base_model() fallback.")
+                        continue
+                    except Exception:
+                        pass
+                if hasattr(nncf_candidate, "base_model"):
+                    nncf_candidate = nncf_candidate.base_model
+                    logger.info("Used .base_model attribute fallback.")
+                    continue
+            # generic unwrap by attribute
+            if hasattr(nncf_candidate, "base_model"):
+                candidate2 = nncf_candidate.base_model
+                if candidate2 is nncf_candidate:
+                    break
+                nncf_candidate = candidate2
+                continue
+            if hasattr(nncf_candidate, "model"):
+                candidate2 = nncf_candidate.model
+                if candidate2 is nncf_candidate:
+                    break
+                nncf_candidate = candidate2
+                continue
+            break
+    except Exception as ex_unwrap:
+        logger.warning("Exception while unwrapping PeftModel: %s — will attempt fallback fresh base.", ex_unwrap)
 
-    # Generic fallbacks
-    if hasattr(model, "base_model"):
-        return model.base_model
-    if hasattr(model, "model"):
-        return model.model
-    return model
+    # If still contains lora modules, try robust fallback
+    if contains_lora_modules(nncf_candidate):
+        logger.warning("LoRA modules still detected in candidate model for NNCF. Trying robust fallback with fresh base load.")
+        try:
+            fresh_base = AutoModelForCausalLM.from_pretrained(
+                model_args.model_name_or_path,
+                load_in_8bit=False,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                offload_folder=offload_folder,
+                trust_remote_code=True,
+                cache_dir=model_args.cache_dir,
+            )
+            if model_args.lora_weights:
+                try:
+                    tmp_peft = PeftModel.from_pretrained(fresh_base, model_args.lora_weights, torch_dtype=torch.float16, device_map="auto")
+                    if hasattr(tmp_peft, "merge_and_unload") and callable(getattr(tmp_peft, "merge_and_unload")):
+                        try:
+                            fresh_merged = tmp_peft.merge_and_unload()
+                            logger.info("Merged user-provided LoRA weights into fresh base.")
+                            return fresh_merged
+                        except Exception as ex_merge:
+                            logger.warning("merge_and_unload on loaded LoRA failed: %s. Using base_model fallback.", ex_merge)
+                            return getattr(tmp_peft, "base_model", fresh_base)
+                    else:
+                        return getattr(tmp_peft, "base_model", fresh_base)
+                except Exception as ex_attach:
+                    logger.warning("Failed to attach/merge provided LoRA weights onto fresh base: %s. Using fresh base without LoRA.", ex_attach)
+                    return fresh_base
+            else:
+                return fresh_base
+        except Exception as ex_fresh:
+            logger.error("Failed to load fresh base model for fallback: %s. Returning best-effort candidate.", ex_fresh)
+            return nncf_candidate
+    else:
+        return nncf_candidate
 
 
 @dataclass
 class LonasTrainingArguments(TrainingArguments):
-    nncf_config: Optional[str] = field(
-        default=None, metadata={"help": "Path to NNCF config file for NAS/quantization"}
-    )
+    nncf_config: Optional[str] = field(default=None, metadata={"help": "Path to NNCF config file for NAS/quantization"})
     lora_r: int = field(default=32, metadata={"help": "Lora R dimension."})
     lora_alpha: float = field(default=64, metadata={"help": "Lora alpha."})
     lora_dropout: float = field(default=0.0, metadata={"help": "Lora dropout."})
@@ -104,8 +171,8 @@ class LonasTrainingArguments(TrainingArguments):
 
 @dataclass
 class DataTrainingArguments:
-    dataset_path: Optional[str] = field(default=None)
-    dataset_config_name: Optional[str] = field(default=None)
+    dataset_path: Optional[str] = field(default=None, metadata={"help": "The path of the dataset to use."})
+    dataset_config_name: Optional[str] = field(default=None, metadata={"help": "The configuration name of the dataset to use."})
     val_set_size: int = field(default=120)
     max_seq_length: int = field(default=128)
     overwrite_cache: bool = field(default=False)
@@ -166,7 +233,7 @@ def main():
     os.makedirs(offload_folder, exist_ok=True)
 
     # ----------------------------
-    # 1) Load base model
+    # 1) Load base model (may be wrapped)
     # ----------------------------
     model = AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
@@ -189,79 +256,39 @@ def main():
         os.makedirs(nncf_config["log_dir"], exist_ok=True)
 
     # ----------------------------
-    # 3) Apply NNCF BEFORE LoRA (robust fallback)
+    # 3) Apply NNCF BEFORE LoRA (robust)
     # ----------------------------
     compression_ctrl = None
     if nncf_config:
-        logger.info("Preparing model for NNCF (ensuring no LoRA modules present)...")
+        logger.info("Preparing model for NNCF (aggressive unwrap / fallback)...")
+        nncf_candidate = get_base_model_for_nncf_aggressive(model, model_args, offload_folder)
 
-        def model_contains_lora_modules(m: torch.nn.Module) -> bool:
-            for name, module in m.named_modules():
-                lname = name.lower()
-                if "lora" in lname or "lora_" in lname or "loramodule" in lname:
-                    return True
-                # Also check module repr for ModuleDict containing lora
-                try:
-                    rep = repr(module)
-                    if "ModuleDict" in rep and "lora" in rep:
-                        return True
-                except Exception:
-                    pass
-            return False
+        # Final sanity check: if still contains lora modules, raise clear error
+        if contains_lora_modules(nncf_candidate):
+            logger.error("After unwrap/fallback, LoRA modules still present in the candidate model. NNCF cannot proceed.")
+            raise RuntimeError(
+                "LoRA modules remain in model candidate — cannot build NNCF graph. "
+                "Ensure LoRA is merged (merge_and_unload) or call NNCF on the original base model."
+            )
 
-        # Start with best-effort base extraction
-        nncf_network = get_base_model_for_nncf(model)
-
-        # If candidate still contains lora modules, attempt robust fallback using fresh base load and optional merge
-        if model_contains_lora_modules(nncf_network):
-            logger.warning("Detected LoRA modules in candidate model for NNCF tracing. Attempting robust fallback...")
-            try:
-                logger.info("Loading a fresh base model from model_name_or_path to ensure clean graph for NNCF...")
-                fresh_base = AutoModelForCausalLM.from_pretrained(
-                    model_args.model_name_or_path,
-                    load_in_8bit=False,
-                    torch_dtype=torch.float16,
-                    device_map="auto",
-                    offload_folder=offload_folder,
-                    trust_remote_code=True,
-                    cache_dir=model_args.cache_dir,
-                )
-                # If user provided lora_weights, try to attach and merge them to fresh base
-                if model_args.lora_weights:
-                    try:
-                        logger.info("Attaching user-provided LoRA weights to fresh base, then attempting merge...")
-                        tmp_peft = PeftModel.from_pretrained(fresh_base, model_args.lora_weights, torch_dtype=torch.float16, device_map="auto")
-                        if hasattr(tmp_peft, "merge_and_unload") and callable(getattr(tmp_peft, "merge_and_unload")):
-                            try:
-                                fresh_merged = tmp_peft.merge_and_unload()
-                                nncf_network = fresh_merged
-                                logger.info("Merged user LoRA weights into fresh base model.")
-                            except Exception as ex_merge:
-                                logger.warning(f"merge_and_unload() on loaded LoRA failed: {ex_merge}. Using base without merge.")
-                                nncf_network = getattr(tmp_peft, "base_model", fresh_base)
-                        else:
-                            # fallback to base_model if merge not available
-                            nncf_network = getattr(tmp_peft, "base_model", fresh_base)
-                            logger.warning("Loaded PeftModel but merge_and_unload() not available; using base_model fallback.")
-                    except Exception as ex_peft_load:
-                        logger.warning(f"Failed to load/merge provided LoRA weights onto fresh base: {ex_peft_load}. Using fresh base without LoRA.")
-                        nncf_network = fresh_base
-                else:
-                    # no lora weights provided — just use fresh base
-                    nncf_network = fresh_base
-            except Exception as ex_fallback:
-                logger.error(f"Failed to perform robust fallback to fresh base model: {ex_fallback}. Proceeding with best-effort candidate (may fail).")
-                # keep nncf_network as-is (best-effort)
-        else:
-            logger.info("Candidate nncf_network does not contain LoRA modules — proceeding.")
-
-        # finally build nncf network and compressed model
+        # build nncf network and compressed model
         try:
-            nncf_network = create_nncf_network(nncf_network, nncf_config)
+            nncf_network = create_nncf_network(nncf_candidate, nncf_config)
             algo_name = nncf_config.get("bootstrapNAS", {}).get("training", {}).get("algorithm", "progressive_shrinking")
             compression_ctrl, model = create_compressed_model_from_algo_names(nncf_network, nncf_config, algo_names=[algo_name])
+
+            # Debug print modules after NNCF
+            try:
+                print("=== module names containing 'proj' after NNCF ===")
+                for n, m in model.named_modules():
+                    if any(k in n for k in ["q_proj", "k_proj", "v_proj", "proj"]):
+                        print(n, type(m))
+                print("=== end module list ===")
+            except Exception as e:
+                logger.warning(f"Failed to list modules after NNCF: {e}")
+
         except Exception as ex_nncf:
-            logger.exception("Failed to create compressed model with NNCF. Exception follows:")
+            logger.exception("Failed to create compressed model with NNCF: %s", ex_nncf)
             raise
 
     # ----------------------------
@@ -291,10 +318,337 @@ def main():
     tokenizer.pad_token_id = 0
     tokenizer.padding_side = "left"
 
-    logger.info("✅ Model and tokenizer initialized successfully.")
+    # ----------------------------
+    # 6) Dataset + tokenization helpers
+    # ----------------------------
+    def tokenize(prompt, add_eos_token=True):
+        result = tokenizer(
+            prompt,
+            truncation=True,
+            max_length=data_args.cutoff_len,
+            padding=True,
+            return_tensors=None,
+        )
+        if (
+            result["input_ids"][-1] != tokenizer.eos_token_id
+            and len(result["input_ids"]) < data_args.cutoff_len
+            and add_eos_token
+        ):
+            result["input_ids"].append(tokenizer.eos_token_id)
+            result["attention_mask"].append(1)
+        result["labels"] = result["input_ids"].copy()
+        return result
 
-    # The rest of your pipeline (dataset, tokenization, Trainer, training/eval) can continue here.
-    # I leave the remainder of your original pipeline in place to avoid removing logic you already had.
+    def generate_prompt(data_point):
+        if data_point.get("input"):
+            return f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request. 
+
+### Instruction:
+{data_point['instruction']}
+
+### Input:
+{data_point['input']}
+
+### Response:
+{data_point['output']}"""
+        else:
+            return f"""Below is an instruction that describes a task. Write a response that appropriately completes the request.  
+
+### Instruction:
+{data_point['instruction']}
+
+### Response:
+{data_point['output']}"""
+
+    def generate_and_tokenize_prompt(data_point):
+        full_prompt = generate_prompt(data_point)
+        tokenized_full_prompt = tokenize(full_prompt)
+        if not training_args.train_on_inputs:
+            user_prompt = generate_prompt({**data_point, "output": ""})
+            tokenized_user_prompt = tokenize(user_prompt, add_eos_token=False)
+            user_prompt_len = len(tokenized_user_prompt["input_ids"])
+            tokenized_full_prompt["labels"] = [-100] * user_prompt_len + tokenized_full_prompt["labels"][
+                user_prompt_len:
+            ]
+        return tokenized_full_prompt
+
+    train_dataset, eval_dataset = None, None
+    if training_args.do_train or training_args.do_search:
+        data = load_dataset("json", data_files=data_args.dataset_path)
+        val_set_size = data_args.val_set_size
+        if val_set_size > 0:
+            train_val = data["train"].train_test_split(test_size=val_set_size, shuffle=True, seed=42)
+            train_dataset = train_val["train"].shuffle().map(generate_and_tokenize_prompt)
+            eval_dataset = train_val["test"].shuffle().map(generate_and_tokenize_prompt)
+        else:
+            train_dataset = data["train"].shuffle().map(generate_and_tokenize_prompt)
+            eval_dataset = None
+
+    # ----------------------------
+    # 7) Trainer
+    # ----------------------------
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset if training_args.do_train else None,
+        eval_dataset=eval_dataset if training_args.do_eval else None,
+        data_collator=transformers.DataCollatorForSeq2Seq(
+            tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+        ),
+        compression_ctrl=compression_ctrl,
+    )
+
+    if nncf_config is not None:
+        if not (training_args.local_rank in [-1, 0] or training_args.no_cuda):
+            compression_ctrl.distributed()
+
+    model.config.use_cache = False
+
+    # ----------------------------
+    # 8) Training
+    # ----------------------------
+    if training_args.do_train:
+        checkpoint = None
+        if training_args.resume_from_checkpoint is not None:
+            checkpoint = training_args.resume_from_checkpoint
+        elif last_checkpoint is not None:
+            checkpoint = last_checkpoint
+        train_result = trainer.train(resume_from_checkpoint=checkpoint)
+        metrics = train_result.metrics
+        max_train_samples = (
+            data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset)
+        )
+        metrics["train_samples"] = min(max_train_samples, len(train_dataset))
+
+        trainer.save_model()
+        trainer.log_metrics("train", metrics)
+        trainer.save_metrics("train", metrics)
+        trainer.save_state()
+
+    # ----------------------------
+    # 9) Simple evaluate/predict helpers (kept from your original)
+    # ----------------------------
+    def extract_answer(dataset_name, sentence: str) -> str:
+        sentence_ = sentence.strip()
+        if dataset_name == "boolq":
+            pred_answers = re.findall(r"true|false", sentence_)
+            return pred_answers[0] if pred_answers else ""
+        if dataset_name == "piqa":
+            pred_answers = re.findall(r"solution1|solution2", sentence_)
+            return pred_answers[0] if pred_answers else ""
+        if dataset_name in ["social_i_qa", "ARC-Challenge", "ARC-Easy", "openbookqa"]:
+            pred_answers = re.findall(r"answer1|answer2|answer3|answer4|answer5", sentence_)
+            return pred_answers[0] if pred_answers else ""
+        if dataset_name == "hellaswag":
+            pred_answers = re.findall(r"ending1|ending2|ending3|ending4", sentence_)
+            return pred_answers[0] if pred_answers else ""
+        if dataset_name == "winogrande":
+            pred_answers = re.findall(r"option1|option2", sentence_)
+            return pred_answers[0] if pred_answers else ""
+        return ""
+
+    def load_test_data(test_dataset) -> list:
+        file_path = f"datasets/{test_dataset}/test.json"
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"can not find dataset file : {file_path}")
+        json_data = json.load(open(file_path, "r"))
+        return json_data
+
+    def generate_prompt_eval(instruction, input=None):
+        if input:
+            return f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+
+### Instruction:
+{instruction}
+
+### Input:
+{input}
+
+### Response:
+"""
+        else:
+            return f"""Below is an instruction that describes a task. Write a response that appropriately completes the request. 
+
+### Instruction:
+{instruction}
+
+### Response:
+"""
+
+    def evaluate_one_sample(
+        instruction,
+        input=None,
+        model=None,
+        temperature=0.1,
+        top_p=0.75,
+        top_k=40,
+        num_beams=4,
+        max_new_tokens=32,
+        **kwargs,
+    ):
+        prompts = generate_prompt_eval(instruction, input)
+        inputs = tokenizer(prompts, return_tensors="pt")
+        input_ids = inputs["input_ids"].to(model.device)
+        generation_config = GenerationConfig(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            num_beams=num_beams,
+            **kwargs,
+        )
+        with torch.no_grad():
+            generation_output = model.generate(
+                input_ids=input_ids,
+                generation_config=generation_config,
+                return_dict_in_generate=True,
+                output_scores=True,
+                max_new_tokens=max_new_tokens,
+                use_cache=True,
+            )
+        s = generation_output.sequences[0]
+        output = tokenizer.decode(s)
+        return output.split("### Response:")[1].strip()
+
+    def evaluate(model_, dataset_name, save_file):
+        model_.eval()
+        dataset = load_test_data(dataset_name)
+
+        total = len(dataset)
+        correct = 0
+        output_data = []
+        for idx, data in enumerate(dataset):
+            instruction = data.get("instruction")
+            output = evaluate_one_sample(instruction, model=model_)
+            label = data.get("answer")
+            flag = False
+            predict = extract_answer(dataset_name, output)
+            if label == predict:
+                correct += 1
+                flag = True
+            new_data = copy.deepcopy(data)
+            new_data["output_pred"] = output
+            new_data["pred"] = predict
+            new_data["flag"] = flag
+            output_data.append(new_data)
+            print(data["instruction"])
+            print(output)
+            print("prediction:", predict)
+            print("label:", label)
+
+            print(f"\rtest:{idx + 1}/{total} | accuracy {correct}  {correct / (idx + 1)}")
+
+            with open(save_file, "w+") as f:
+                json.dump(output_data, f, indent=4)
+
+        acc = correct / total
+        return acc
+
+    # ----------------------------
+    # 10) do_test / search / predict flows (kept core logic)
+    # ----------------------------
+    if training_args.do_test and training_args.local_rank <= 0:
+        if compression_ctrl is not None:
+            trainer.compression_ctrl.multi_elasticity_handler.enable_all()
+            compression_ctrl.multi_elasticity_handler.width_handler.width_num_params_indicator = -1
+            heuristic_config = {
+                k: v[(len(v) - 1) // 2] for k, v in compression_ctrl.multi_elasticity_handler.width_search_space.items()
+            }
+            heuristic_config = {ElasticityDim.WIDTH: heuristic_config}
+            trainer.compression_ctrl.multi_elasticity_handler.activate_subnet_for_config(heuristic_config)
+            # Evaluate heuristic subnetwork
+            non_zero_params = sum([(param.data != 0).sum().item() for _, param in trainer.model.named_parameters()])
+            macs, weights = trainer.compression_ctrl.multi_elasticity_handler.count_flops_and_weights_for_active_subnet()
+            logger.info(f"Heuristic non_zero_params: {non_zero_params}, macs: {macs}, weights: {weights}")
+            test_subnetwork = lambda sub, name: None  # keep original function out to avoid duplication
+            # you can call evaluate on trainer.model as needed
+        else:
+            all_results = []
+            for test_dataset in TEST_DATASETS:
+                logger.info(f"*** Evaluation on {test_dataset} ***")
+                save_file = os.path.join(training_args.output_dir, f"{test_dataset}.res.json")
+                non_zero_params = sum([(param.data != 0).sum().item() for _, param in trainer.model.named_parameters()])
+                accuracy = evaluate(trainer.model, test_dataset, save_file)
+                all_results.append(accuracy)
+                metrics = {
+                    f"{test_dataset}_accuracy": accuracy,
+                    "non_zero_params": non_zero_params,
+                }
+                trainer.save_metrics("eval", metrics)
+            avg_metrics = {"avg_accuracy": sum(all_results) / len(all_results)}
+            trainer.save_metrics("eval", avg_metrics)
+            trainer.log_metrics("eval", avg_metrics)
+
+    if training_args.do_search and nncf_config is not None and training_args.local_rank <= 0:
+        logger.info("*** Search ***")
+        trainer.compression_ctrl.multi_elasticity_handler.enable_all()
+        search_algo = BaseSearchAlgorithm.from_config(trainer.model, trainer.compression_ctrl, nncf_config)
+
+        def validate_model_fn(model_, eval_dataset):
+            correct = 0
+            for data in eval_dataset:
+                instruction = data.get("instruction")
+                output = evaluate_one_sample(instruction, model=model_)
+                label = data.get("answer")
+                dataset_name = None
+                if label in ["true", "false"]:
+                    dataset_name = "boolq"
+                elif "solution" in label:
+                    dataset_name = "piqa"
+                elif "answer" in label:
+                    dataset_name = "social_i_qa"
+                elif "ending" in label:
+                    dataset_name = "hellaswag"
+                elif "option" in label:
+                    dataset_name = "winogrande"
+                predict = extract_answer(dataset_name, output)
+                if label == predict:
+                    correct += 1
+            acc = correct / len(eval_dataset)
+            return acc
+
+        # Maximal
+        trainer.compression_ctrl.multi_elasticity_handler.activate_supernet()
+        max_eval_acc = validate_model_fn(trainer.model, eval_dataset)
+
+        # Heuristic
+        compression_ctrl.multi_elasticity_handler.width_handler.width_num_params_indicator = -1
+        heuristic_config = {k: v[(len(v) - 1) // 2] for k, v in compression_ctrl.multi_elasticity_handler.width_search_space.items()}
+        heuristic_config = {ElasticityDim.WIDTH: heuristic_config}
+        trainer.compression_ctrl.multi_elasticity_handler.activate_subnet_for_config(heuristic_config)
+        heu_eval_acc = validate_model_fn(trainer.model, eval_dataset)
+
+        metrics = {"val_maximal_accuracy": max_eval_acc, "val_heuristic_accuracy": heu_eval_acc}
+        trainer.save_metrics("eval", metrics)
+        trainer.log_metrics("eval", metrics)
+
+        elasticity_ctrl, best_config, performance_metrics = search_algo.run(
+            validate_model_fn, eval_dataset, training_args.output_dir
+        )
+
+        search_algo.search_progression_to_csv()
+        search_algo.evaluators_to_csv()
+        search_algo.visualize_search_progression()
+
+        logger.info("Best config: {best_config}".format(best_config=best_config))
+        logger.info("Performance metrics: {performance_metrics}".format(performance_metrics=performance_metrics))
+        trainer.save_metrics("eval", {"performance_metrics": list(performance_metrics)})
+
+        # test best config
+        trainer.compression_ctrl.multi_elasticity_handler.activate_subnet_for_config(best_config)
+        best_eval_acc = validate_model_fn(trainer.model, eval_dataset)
+        trainer.save_metrics("eval", {"val_best_accuracy": best_eval_acc})
+
+    kwargs = {"finetuned_from": model_args.model_name_or_path}
+
+    if training_args.push_to_hub:
+        trainer.push_to_hub(**kwargs)
+    else:
+        trainer.create_model_card(**kwargs)
+
+
+def _mp_fn(index):
+    main()
+
 
 if __name__ == "__main__":
     main()
