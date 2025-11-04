@@ -1,5 +1,15 @@
 #!/usr/bin/env python
 # coding=utf-8
+"""
+run_commonsense.py - Robust version for combining LoRA (PEFT) and NNCF (BootstrapNAS).
+
+Key behavior:
+- Ensure LoRA (PEFT) adapters are merged/removed before passing a model to NNCF.
+- If user provided separate lora_weights path, attempt to merge them into a fresh base before NNCF.
+- Apply NNCF (create_compressed_model_from_algo_names) on a clean base model.
+- After compression, optionally attach LoRA (new or loaded) for fine-tuning.
+"""
+
 import copy
 import json
 import logging
@@ -26,6 +36,7 @@ from transformers import (
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
 
+# nncf imports (Intel NNCF)
 from nncf import NNCFConfig
 from nncf.experimental.torch.nas.bootstrapNAS.elasticity.elasticity_dim import ElasticityDim
 from nncf.experimental.torch.nas.bootstrapNAS.training.model_creator_helpers import (
@@ -47,11 +58,12 @@ TEST_DATASETS = [
     "hellaswag",
 ]
 
+
 # -------------------------------
-# Helper: aggressive unwrap & merge
+# Utilities for dealing with PEFT/LoRA
 # -------------------------------
 def contains_lora_modules(mod: torch.nn.Module) -> bool:
-    """Detect Lora modules by name/repr heuristics."""
+    """Heuristic to detect presence of LoRA adapters in a model's modules."""
     for name, module in mod.named_modules():
         lname = name.lower()
         if "lora" in lname or "lora_" in lname or "loramodule" in lname:
@@ -65,98 +77,116 @@ def contains_lora_modules(mod: torch.nn.Module) -> bool:
     return False
 
 
-def get_base_model_for_nncf_aggressive(model: torch.nn.Module, model_args, offload_folder: str):
+def merge_peft_if_possible(peft_model: PeftModel):
     """
-    Aggressive extraction of a clean base model for NNCF:
-    - tries merge_and_unload if PeftModel
-    - falls back to get_base_model / base_model / model attributes
-    - if lora modules still detected, reload fresh base from model_args.model_name_or_path
-      and (optionally) attach+merge model_args.lora_weights
-    Returns the clean model suitable for create_nncf_network.
+    If peft_model supports merge_and_unload(), call it and return merged base model.
+    Fallback to get_base_model() or .base_model attribute.
     """
-    nncf_candidate = model
-    try:
-        unwrap_attempts = 0
-        while True:
-            if isinstance(nncf_candidate, PeftModel):
-                # try merge_and_unload
-                if hasattr(nncf_candidate, "merge_and_unload") and callable(getattr(nncf_candidate, "merge_and_unload")):
-                    try:
-                        logger.info("Detected PeftModel: calling merge_and_unload() (attempt %d)...", unwrap_attempts + 1)
-                        merged = nncf_candidate.merge_and_unload()
-                        nncf_candidate = merged
-                        logger.info("merge_and_unload succeeded.")
-                        unwrap_attempts += 1
-                        continue
-                    except Exception as e:
-                        logger.warning("merge_and_unload failed: %s — falling back to base_model/get_base_model", e)
-                # fallback get_base_model or attribute
-                if hasattr(nncf_candidate, "get_base_model") and callable(getattr(nncf_candidate, "get_base_model")):
-                    try:
-                        nncf_candidate = nncf_candidate.get_base_model()
-                        logger.info("Used get_base_model() fallback.")
-                        continue
-                    except Exception:
-                        pass
-                if hasattr(nncf_candidate, "base_model"):
-                    nncf_candidate = nncf_candidate.base_model
-                    logger.info("Used .base_model attribute fallback.")
-                    continue
-            # generic unwrap by attribute
-            if hasattr(nncf_candidate, "base_model"):
-                candidate2 = nncf_candidate.base_model
-                if candidate2 is nncf_candidate:
-                    break
-                nncf_candidate = candidate2
-                continue
-            if hasattr(nncf_candidate, "model"):
-                candidate2 = nncf_candidate.model
-                if candidate2 is nncf_candidate:
-                    break
-                nncf_candidate = candidate2
-                continue
-            break
-    except Exception as ex_unwrap:
-        logger.warning("Exception while unwrapping PeftModel: %s — will attempt fallback fresh base.", ex_unwrap)
-
-    # If still contains lora modules, try robust fallback
-    if contains_lora_modules(nncf_candidate):
-        logger.warning("LoRA modules still detected in candidate model for NNCF. Trying robust fallback with fresh base load.")
+    # prefer merge_and_unload if available
+    if hasattr(peft_model, "merge_and_unload") and callable(getattr(peft_model, "merge_and_unload")):
+        logger.info("Calling merge_and_unload() on PeftModel...")
         try:
-            fresh_base = AutoModelForCausalLM.from_pretrained(
-                model_args.model_name_or_path,
-                load_in_8bit=False,
-                torch_dtype=torch.float16,
-                device_map="auto",
-                offload_folder=offload_folder,
-                trust_remote_code=True,
-                cache_dir=model_args.cache_dir,
-            )
-            if model_args.lora_weights:
-                try:
-                    tmp_peft = PeftModel.from_pretrained(fresh_base, model_args.lora_weights, torch_dtype=torch.float16, device_map="auto")
-                    if hasattr(tmp_peft, "merge_and_unload") and callable(getattr(tmp_peft, "merge_and_unload")):
-                        try:
-                            fresh_merged = tmp_peft.merge_and_unload()
-                            logger.info("Merged user-provided LoRA weights into fresh base.")
-                            return fresh_merged
-                        except Exception as ex_merge:
-                            logger.warning("merge_and_unload on loaded LoRA failed: %s. Using base_model fallback.", ex_merge)
-                            return getattr(tmp_peft, "base_model", fresh_base)
-                    else:
-                        return getattr(tmp_peft, "base_model", fresh_base)
-                except Exception as ex_attach:
-                    logger.warning("Failed to attach/merge provided LoRA weights onto fresh base: %s. Using fresh base without LoRA.", ex_attach)
-                    return fresh_base
+            merged = peft_model.merge_and_unload()
+            logger.info("merge_and_unload() succeeded.")
+            return merged
+        except Exception as e:
+            logger.warning("merge_and_unload() failed: %s", e)
+
+    # fallback to get_base_model()
+    if hasattr(peft_model, "get_base_model") and callable(getattr(peft_model, "get_base_model")):
+        try:
+            base = peft_model.get_base_model()
+            logger.info("Used get_base_model() fallback.")
+            return base
+        except Exception:
+            logger.warning("get_base_model() fallback failed.")
+
+    # fallback to attribute .base_model
+    if hasattr(peft_model, "base_model"):
+        logger.info("Using .base_model attribute fallback.")
+        return peft_model.base_model
+
+    # as last resort return original object
+    logger.warning("Could not merge/unload PeftModel; returning original object as fallback.")
+    return peft_model
+
+
+def get_clean_base_model_for_nncf(original_model: torch.nn.Module, model_args, offload_folder: str):
+    """
+    Try to obtain a model without LoRA modules to pass to NNCF.
+    Strategy:
+    1) If original_model already PeftModel: try merge_and_unload/get_base_model/.base_model
+    2) If still contains lora modules => load fresh base from model_args.model_name_or_path and:
+        a) if model_args.lora_weights provided => attach then merge (if possible)
+        b) else use fresh base
+    3) If still LoRA present after all fallbacks => raise RuntimeError with helpful message
+    """
+    candidate = original_model
+
+    # 1) If it's a PeftModel or wrapped, attempt to merge/unload / get base
+    try:
+        if isinstance(candidate, PeftModel):
+            candidate = merge_peft_if_possible(candidate)
+    except Exception as e:
+        logger.warning("isinstance(PeftModel) check or merge attempt raised: %s", e)
+
+    # Generic attribute fallbacks
+    if not isinstance(candidate, PeftModel):
+        if hasattr(candidate, "base_model"):
+            candidate = candidate.base_model
+        elif hasattr(candidate, "model"):
+            candidate = candidate.model
+
+    # If no LoRA present -> good
+    if not contains_lora_modules(candidate):
+        logger.info("Candidate clean model detected (no LoRA modules).")
+        return candidate
+
+    # 2) Robust fallback: load fresh base from model_args.model_name_or_path
+    logger.warning("LoRA modules detected in candidate model. Attempting robust fallback by loading fresh base model.")
+    try:
+        fresh_base = AutoModelForCausalLM.from_pretrained(
+            model_args.model_name_or_path,
+            load_in_8bit=False,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            offload_folder=offload_folder,
+            trust_remote_code=True,
+            cache_dir=model_args.cache_dir,
+        )
+    except Exception as e:
+        logger.error("Failed to load fresh base model for fallback: %s", e)
+        # if we cannot load fresh base, return the best-effort candidate (NNCF will likely fail)
+        return candidate
+
+    # If user provided lora weights, try to attach and merge them to fresh base (so we can produce merged result)
+    if getattr(model_args, "lora_weights", None):
+        try:
+            logger.info("Attaching provided LoRA weights to fresh base and attempting merge...")
+            tmp = PeftModel.from_pretrained(fresh_base, model_args.lora_weights, torch_dtype=torch.float16, device_map="auto")
+            merged_tmp = merge_peft_if_possible(tmp)
+            if merged_tmp is not None:
+                # merged_tmp could be a base model or fallback; ensure it is not containing LoRA
+                if not contains_lora_modules(merged_tmp):
+                    logger.info("Successfully obtained merged fresh model without LoRA.")
+                    return merged_tmp
+                else:
+                    logger.warning("Merged fresh model still contains LoRA modules after merge attempt.")
+                    return getattr(tmp, "base_model", fresh_base)
             else:
+                logger.warning("merge_peft_if_possible returned None; using fresh_base.")
                 return fresh_base
-        except Exception as ex_fresh:
-            logger.error("Failed to load fresh base model for fallback: %s. Returning best-effort candidate.", ex_fresh)
-            return nncf_candidate
+        except Exception as e:
+            logger.warning("Failed to attach/merge provided LoRA weights onto fresh base: %s. Using fresh base without LoRA.", e)
+            return fresh_base
     else:
-        return nncf_candidate
+        # no lora_weights provided, use fresh base
+        return fresh_base
 
 
+# -------------------------------
+# Dataclasses (arguments)
+# -------------------------------
 @dataclass
 class LonasTrainingArguments(TrainingArguments):
     nncf_config: Optional[str] = field(default=None, metadata={"help": "Path to NNCF config file for NAS/quantization"})
@@ -199,6 +229,9 @@ class ModelArguments:
     ignore_mismatched_sizes: bool = field(default=False)
 
 
+# -------------------------------
+# Main
+# -------------------------------
 def main():
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, LonasTrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
@@ -218,6 +251,7 @@ def main():
     datasets.utils.logging.set_verbosity(logger.level)
     transformers.utils.logging.set_verbosity(logger.level)
 
+    # detect last checkpoint if training
     last_checkpoint = None
     if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
         last_checkpoint = get_last_checkpoint(training_args.output_dir)
@@ -228,13 +262,14 @@ def main():
 
     set_seed(training_args.seed)
 
-    # make sure offload folder exists (device_map="auto" may offload to disk)
+    # ensure offload folder exists (for device_map="auto")
     offload_folder = os.path.join(training_args.output_dir, "offload")
     os.makedirs(offload_folder, exist_ok=True)
 
     # ----------------------------
     # 1) Load base model (may be wrapped)
     # ----------------------------
+    logger.info("Loading model '%s' ...", model_args.model_name_or_path)
     model = AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         load_in_8bit=False,
@@ -246,57 +281,58 @@ def main():
     )
 
     # ----------------------------
-    # 2) Prepare nncf_config
+    # 2) Prepare nncf_config (if any)
     # ----------------------------
     nncf_config = None
     if training_args.nncf_config:
+        logger.info("Loading NNCF config from %s", training_args.nncf_config)
         nncf_config = NNCFConfig.from_json(training_args.nncf_config)
         if nncf_config.get("log_dir") is None:
             nncf_config["log_dir"] = training_args.output_dir
         os.makedirs(nncf_config["log_dir"], exist_ok=True)
 
     # ----------------------------
-    # 3) Apply NNCF BEFORE LoRA (robust)
+    # 3) Ensure clean base for NNCF (merge LoRA if needed)
     # ----------------------------
     compression_ctrl = None
     if nncf_config:
-        logger.info("Preparing model for NNCF (aggressive unwrap / fallback)...")
-        nncf_candidate = get_base_model_for_nncf_aggressive(model, model_args, offload_folder)
+        logger.info("Preparing clean base model for NNCF (merging/removing LoRA if present)...")
+        nncf_candidate = get_clean_base_model_for_nncf(model, model_args, offload_folder)
 
-        # Final sanity check: if still contains lora modules, raise clear error
+        # final check
         if contains_lora_modules(nncf_candidate):
-            logger.error("After unwrap/fallback, LoRA modules still present in the candidate model. NNCF cannot proceed.")
+            logger.error("LoRA modules remain in the candidate model after all attempts. NNCF cannot proceed.")
             raise RuntimeError(
-                "LoRA modules remain in model candidate — cannot build NNCF graph. "
+                "LoRA modules remain in the model candidate — cannot build NNCF graph. "
                 "Ensure LoRA is merged (merge_and_unload) or call NNCF on the original base model."
             )
 
-        # build nncf network and compressed model
+        # create nncf network and compressed model
         try:
             nncf_network = create_nncf_network(nncf_candidate, nncf_config)
             algo_name = nncf_config.get("bootstrapNAS", {}).get("training", {}).get("algorithm", "progressive_shrinking")
             compression_ctrl, model = create_compressed_model_from_algo_names(nncf_network, nncf_config, algo_names=[algo_name])
-
-            # Debug print modules after NNCF
-            try:
-                print("=== module names containing 'proj' after NNCF ===")
-                for n, m in model.named_modules():
-                    if any(k in n for k in ["q_proj", "k_proj", "v_proj", "proj"]):
-                        print(n, type(m))
-                print("=== end module list ===")
-            except Exception as e:
-                logger.warning(f"Failed to list modules after NNCF: {e}")
-
-        except Exception as ex_nncf:
-            logger.exception("Failed to create compressed model with NNCF: %s", ex_nncf)
+            logger.info("NNCF compression applied successfully.")
+        except Exception as e:
+            logger.exception("Failed while creating compressed model from NNCF: %s", e)
             raise
 
+        # debug print some modules
+        try:
+            print("=== module names containing 'proj' after NNCF ===")
+            for n, m in model.named_modules():
+                if any(k in n for k in ["q_proj", "k_proj", "v_proj", "proj"]):
+                    print(n, type(m))
+            print("=== end module list ===")
+        except Exception:
+            logger.debug("Failed to print modules after NNCF (non-fatal).")
+
     # ----------------------------
-    # 4) Apply LoRA (after NNCF)
+    # 4) Apply or load LoRA (after NNCF)
     # ----------------------------
     if training_args.lora:
         if model_args.lora_weights is None:
-            logger.info("Adding LoRA modules (fresh)...")
+            logger.info("Adding new LoRA modules on top of (possibly compressed) model...")
             lora_config = LoraConfig(
                 r=training_args.lora_r,
                 lora_alpha=training_args.lora_alpha,
@@ -308,7 +344,7 @@ def main():
             model = get_peft_model(model, lora_config)
             model.print_trainable_parameters()
         else:
-            logger.info("Loading LoRA weights from %s ...", model_args.lora_weights)
+            logger.info("Loading LoRA weights from %s onto current model...", model_args.lora_weights)
             model = PeftModel.from_pretrained(model, model_args.lora_weights, torch_dtype=torch.float16, device_map="auto")
 
     # ----------------------------
@@ -318,8 +354,10 @@ def main():
     tokenizer.pad_token_id = 0
     tokenizer.padding_side = "left"
 
+    logger.info("Model & tokenizer ready. Proceeding to dataset & training pipeline...")
+
     # ----------------------------
-    # 6) Dataset + tokenization helpers
+    # 6) Dataset + tokenization helpers (kept same as your original)
     # ----------------------------
     def tokenize(prompt, add_eos_token=True):
         result = tokenizer(
@@ -405,28 +443,23 @@ def main():
     model.config.use_cache = False
 
     # ----------------------------
-    # 8) Training
+    # 8) Training loop
     # ----------------------------
     if training_args.do_train:
-        checkpoint = None
-        if training_args.resume_from_checkpoint is not None:
-            checkpoint = training_args.resume_from_checkpoint
-        elif last_checkpoint is not None:
-            checkpoint = last_checkpoint
+        checkpoint = training_args.resume_from_checkpoint if training_args.resume_from_checkpoint else last_checkpoint
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         metrics = train_result.metrics
         max_train_samples = (
             data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset)
         )
         metrics["train_samples"] = min(max_train_samples, len(train_dataset))
-
         trainer.save_model()
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
         trainer.save_state()
 
     # ----------------------------
-    # 9) Simple evaluate/predict helpers (kept from your original)
+    # 9) Simple evaluate/predict helpers (kept)
     # ----------------------------
     def extract_answer(dataset_name, sentence: str) -> str:
         sentence_ = sentence.strip()
@@ -544,7 +577,7 @@ def main():
         return acc
 
     # ----------------------------
-    # 10) do_test / search / predict flows (kept core logic)
+    # 10) do_test / search flows (kept original logic)
     # ----------------------------
     if training_args.do_test and training_args.local_rank <= 0:
         if compression_ctrl is not None:
@@ -555,12 +588,7 @@ def main():
             }
             heuristic_config = {ElasticityDim.WIDTH: heuristic_config}
             trainer.compression_ctrl.multi_elasticity_handler.activate_subnet_for_config(heuristic_config)
-            # Evaluate heuristic subnetwork
-            non_zero_params = sum([(param.data != 0).sum().item() for _, param in trainer.model.named_parameters()])
-            macs, weights = trainer.compression_ctrl.multi_elasticity_handler.count_flops_and_weights_for_active_subnet()
-            logger.info(f"Heuristic non_zero_params: {non_zero_params}, macs: {macs}, weights: {weights}")
-            test_subnetwork = lambda sub, name: None  # keep original function out to avoid duplication
-            # you can call evaluate on trainer.model as needed
+            # Evaluate heuristic subnetwork as desired...
         else:
             all_results = []
             for test_dataset in TEST_DATASETS:
@@ -606,11 +634,9 @@ def main():
             acc = correct / len(eval_dataset)
             return acc
 
-        # Maximal
         trainer.compression_ctrl.multi_elasticity_handler.activate_supernet()
         max_eval_acc = validate_model_fn(trainer.model, eval_dataset)
 
-        # Heuristic
         compression_ctrl.multi_elasticity_handler.width_handler.width_num_params_indicator = -1
         heuristic_config = {k: v[(len(v) - 1) // 2] for k, v in compression_ctrl.multi_elasticity_handler.width_search_space.items()}
         heuristic_config = {ElasticityDim.WIDTH: heuristic_config}
@@ -633,13 +659,11 @@ def main():
         logger.info("Performance metrics: {performance_metrics}".format(performance_metrics=performance_metrics))
         trainer.save_metrics("eval", {"performance_metrics": list(performance_metrics)})
 
-        # test best config
         trainer.compression_ctrl.multi_elasticity_handler.activate_subnet_for_config(best_config)
         best_eval_acc = validate_model_fn(trainer.model, eval_dataset)
         trainer.save_metrics("eval", {"val_best_accuracy": best_eval_acc})
 
     kwargs = {"finetuned_from": model_args.model_name_or_path}
-
     if training_args.push_to_hub:
         trainer.push_to_hub(**kwargs)
     else:
