@@ -189,28 +189,80 @@ def main():
         os.makedirs(nncf_config["log_dir"], exist_ok=True)
 
     # ----------------------------
-    # 3) Apply NNCF BEFORE LoRA
+    # 3) Apply NNCF BEFORE LoRA (robust fallback)
     # ----------------------------
     compression_ctrl = None
     if nncf_config:
-        logger.info("Applying NNCF/BootstrapNAS on base model...")
+        logger.info("Preparing model for NNCF (ensuring no LoRA modules present)...")
 
-        # Ensure we pass the pure base model (merge LoRA if it was already attached)
+        def model_contains_lora_modules(m: torch.nn.Module) -> bool:
+            for name, module in m.named_modules():
+                lname = name.lower()
+                if "lora" in lname or "lora_" in lname or "loramodule" in lname:
+                    return True
+                # Also check module repr for ModuleDict containing lora
+                try:
+                    rep = repr(module)
+                    if "ModuleDict" in rep and "lora" in rep:
+                        return True
+                except Exception:
+                    pass
+            return False
+
+        # Start with best-effort base extraction
         nncf_network = get_base_model_for_nncf(model)
-        # create nncf network and compressed model
-        nncf_network = create_nncf_network(nncf_network, nncf_config)
-        algo_name = nncf_config.get("bootstrapNAS", {}).get("training", {}).get("algorithm", "progressive_shrinking")
-        compression_ctrl, model = create_compressed_model_from_algo_names(nncf_network, nncf_config, algo_names=[algo_name])
 
-        # Debug: print some module names
+        # If candidate still contains lora modules, attempt robust fallback using fresh base load and optional merge
+        if model_contains_lora_modules(nncf_network):
+            logger.warning("Detected LoRA modules in candidate model for NNCF tracing. Attempting robust fallback...")
+            try:
+                logger.info("Loading a fresh base model from model_name_or_path to ensure clean graph for NNCF...")
+                fresh_base = AutoModelForCausalLM.from_pretrained(
+                    model_args.model_name_or_path,
+                    load_in_8bit=False,
+                    torch_dtype=torch.float16,
+                    device_map="auto",
+                    offload_folder=offload_folder,
+                    trust_remote_code=True,
+                    cache_dir=model_args.cache_dir,
+                )
+                # If user provided lora_weights, try to attach and merge them to fresh base
+                if model_args.lora_weights:
+                    try:
+                        logger.info("Attaching user-provided LoRA weights to fresh base, then attempting merge...")
+                        tmp_peft = PeftModel.from_pretrained(fresh_base, model_args.lora_weights, torch_dtype=torch.float16, device_map="auto")
+                        if hasattr(tmp_peft, "merge_and_unload") and callable(getattr(tmp_peft, "merge_and_unload")):
+                            try:
+                                fresh_merged = tmp_peft.merge_and_unload()
+                                nncf_network = fresh_merged
+                                logger.info("Merged user LoRA weights into fresh base model.")
+                            except Exception as ex_merge:
+                                logger.warning(f"merge_and_unload() on loaded LoRA failed: {ex_merge}. Using base without merge.")
+                                nncf_network = getattr(tmp_peft, "base_model", fresh_base)
+                        else:
+                            # fallback to base_model if merge not available
+                            nncf_network = getattr(tmp_peft, "base_model", fresh_base)
+                            logger.warning("Loaded PeftModel but merge_and_unload() not available; using base_model fallback.")
+                    except Exception as ex_peft_load:
+                        logger.warning(f"Failed to load/merge provided LoRA weights onto fresh base: {ex_peft_load}. Using fresh base without LoRA.")
+                        nncf_network = fresh_base
+                else:
+                    # no lora weights provided — just use fresh base
+                    nncf_network = fresh_base
+            except Exception as ex_fallback:
+                logger.error(f"Failed to perform robust fallback to fresh base model: {ex_fallback}. Proceeding with best-effort candidate (may fail).")
+                # keep nncf_network as-is (best-effort)
+        else:
+            logger.info("Candidate nncf_network does not contain LoRA modules — proceeding.")
+
+        # finally build nncf network and compressed model
         try:
-            print("=== module names containing 'proj' after NNCF ===")
-            for n, m in model.named_modules():
-                if any(k in n for k in ["q_proj", "k_proj", "v_proj", "proj"]):
-                    print(n, type(m))
-            print("=== end module list ===")
-        except Exception as e:
-            logger.warning(f"Failed to list modules after NNCF: {e}")
+            nncf_network = create_nncf_network(nncf_network, nncf_config)
+            algo_name = nncf_config.get("bootstrapNAS", {}).get("training", {}).get("algorithm", "progressive_shrinking")
+            compression_ctrl, model = create_compressed_model_from_algo_names(nncf_network, nncf_config, algo_names=[algo_name])
+        except Exception as ex_nncf:
+            logger.exception("Failed to create compressed model with NNCF. Exception follows:")
+            raise
 
     # ----------------------------
     # 4) Apply LoRA (after NNCF)
