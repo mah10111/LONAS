@@ -177,6 +177,11 @@ def main():
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+        # مسیر فایل NNCF config
+        nncf_config_path = "nncf_config/unified_commonsense/nncf_lonas_llama_7b.json"
+
+        with open(nncf_config_path, 'r') as f:
+            nncf_config = json.load(f)
 
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
