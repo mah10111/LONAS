@@ -55,7 +55,10 @@ class LonasTrainingArguments(TrainingArguments):
     lora: bool = field(default=False, metadata={"help": "Whether to apply lora or not."})
     train_on_inputs: bool = field(default=True)
     do_test: bool = field(default=False)
-
+    nncf_config: Optional[str] = field(
+    default=None,
+    metadata={"help": "Path to NNCF config JSON file"}
+    )
 
 # --- DataTrainingArguments و ModelArguments بدون تغییر ---
 @dataclass
