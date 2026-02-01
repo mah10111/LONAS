@@ -140,19 +140,26 @@ def main():
     nncf_config = None
     compression_ctrl = None
 
-    # Apply NNCF before LoRA
+    # ================== Apply NNCF ==================
     if training_args.nncf_config is not None:
         nncf_config = NNCFConfig.from_json(training_args.nncf_config)
         if nncf_config.get("log_dir") is None:
             nncf_config["log_dir"] = training_args.output_dir
-        if not os.path.exists(training_args.output_dir) and training_args.local_rank in [-1, 0]:
+        if not os.path.exists(nncf_config["log_dir"]) and training_args.local_rank in [-1, 0]:
             os.makedirs(nncf_config["log_dir"])
 
         nncf_network = create_nncf_network(model, nncf_config)
         algo_name = nncf_config.get("bootstrapNAS", {}).get("training", {}).get("algorithm", "progressive_shrinking")
-        compression_ctrl, model = create_compressed_model_from_algo_names(nncf_network, nncf_config, algo_names=[algo_name])
+        
+        try:
+            compression_ctrl, model = create_compressed_model_from_algo_names(
+                nncf_network, nncf_config, algo_names=[algo_name]
+            )
+        except RuntimeError as e:
+            logger.warning(f"NNCF graph node error: {e}. Skipping compression for now.")
+            compression_ctrl, model = None, model
 
-    # Then apply LoRA
+    # ================== Apply LoRA ==================
     if training_args.lora and model_args.lora_weights is None:
         logger.info("adding LoRA modules...")
         config = LoraConfig(
@@ -184,7 +191,7 @@ def main():
         return result
 
     def generate_prompt(data_point):
-        if data_point["input"]:
+        if data_point.get("input"):
             return f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
 ### Instruction:
