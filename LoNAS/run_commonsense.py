@@ -19,7 +19,7 @@ from peft import PeftModel
 from peft import get_peft_model
 from transformers import AutoModelForCausalLM
 from transformers import AutoTokenizer
-from transformers import GenerationConf
+from transformers import GenerationConfig
 from transformers import HfArgumentParser
 from transformers import Trainer
 from transformers import TrainingArguments
