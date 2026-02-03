@@ -351,15 +351,23 @@ def main():
             eval_dataset = None
 
     # Initialize our Trainer
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=eval_dataset if training_args.do_eval else None,
-        data_collator=transformers.DataCollatorForSeq2Seq(
-            tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
-        ),
-        compression_ctrl=compression_ctrl,
+    trainer =NNCFTrainer(
+      #  model=model,
+       # args=training_args,
+       # train_dataset=train_dataset if training_args.do_train else None,
+       # eval_dataset=eval_dataset if training_args.do_eval else None,
+        # data_collator=transformers.DataCollatorForSeq2Seq(
+         #   tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+        #),
+        #compression_ctrl=compression_ctrl,
+      
+         model=model,
+         args=training_args,
+         train_dataset=data["train"],
+         eval_dataset=data["validation"],
+         tokenizer=tokenizer,
+         compression_ctrl=nncf_ctrl
+          )
     )
 
     if nncf_config is not None:
