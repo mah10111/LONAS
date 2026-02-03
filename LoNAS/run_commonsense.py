@@ -19,7 +19,7 @@ from peft import PeftModel
 from peft import get_peft_model
 from transformers import AutoModelForCausalLM
 from transformers import AutoTokenizer
-from transformers import GenerationConfig
+from transformers import GenerationConf
 from transformers import HfArgumentParser
 from transformers import Trainer
 from transformers import TrainingArguments
@@ -176,8 +176,9 @@ def main():
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
-        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-
+        #model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+        (model_args, data_args, training_args), remaining_args = \
+        parser.parse_args_into_dataclasses(return_remaining_strings=True)
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
