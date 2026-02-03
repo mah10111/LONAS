@@ -368,7 +368,7 @@ def main():
          tokenizer=tokenizer,
          compression_ctrl=nncf_ctrl
           )
-    )
+    
 
     if nncf_config is not None:
         if not (training_args.local_rank in [-1, 0] or training_args.no_cuda):
