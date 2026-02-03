@@ -42,6 +42,10 @@ TEST_DATASETS = ["boolq", "piqa", "social_i_qa", "winogrande", "ARC-Easy", "ARC-
 
 @dataclass
 class LonasTrainingArguments(TrainingArguments):
+    nncf_config: Optional[str] = field(
+    default=None,
+    metadata={"help": "Path to NNCF config JSON file"}
+            )
     lora_r: int = field(default=32, metadata={"help": "Lora R dimension."})
     lora_alpha: float = field(default=64, metadata={"help": " Lora alpha."})
     lora_dropout: float = field(default=0.0, metadata={"help": "Lora dropout."})
