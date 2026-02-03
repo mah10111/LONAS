@@ -172,6 +172,12 @@ class ModelArguments:
 
 
 def main():
+    nncf_config_path = None
+    if "--nncf_config" in sys.argv:
+        idx = sys.argv.index("--nncf_config")
+        nncf_config_path = sys.argv[idx + 1]
+      # remove both flag and value so HF parser doesn't see them
+        del sys.argv[idx:idx + 2]
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, LonasTrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
