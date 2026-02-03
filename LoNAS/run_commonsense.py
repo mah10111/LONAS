@@ -183,8 +183,9 @@ def main():
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         #model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-        (model_args, data_args, training_args), remaining_args = \
-        parser.parse_args_into_dataclasses(return_remaining_strings=True)
+        parsed_args = parser.parse_args_into_dataclasses(return_remaining_strings=True)
+        model_args, data_args, training_args = parsed_args[:3]
+        remaining_args = parsed_args[3]
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
