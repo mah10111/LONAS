@@ -39,7 +39,13 @@ from nncf.torch.model_creation import create_nncf_network
 check_min_version("4.31.0")
 logger = logging.getLogger(__name__)
 TEST_DATASETS = ["boolq", "piqa", "social_i_qa", "winogrande", "ARC-Easy", "ARC-Challenge", "openbookqa", "hellaswag"]
+from typing import Optional
+from dataclasses import field
 
+nncf_config: Optional[str] = field(
+    default=None,
+    metadata={"help": "Path to NNCF config file"}
+)
 
 @dataclass
 class LonasTrainingArguments(TrainingArguments):
