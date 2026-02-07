@@ -22,6 +22,7 @@ from transformers import AutoTokenizer
 from transformers import GenerationConfig
 from transformers import HfArgumentParser
 from transformers import Trainer
+from nncf.torch.nncf_optim import NNCFTrainer
 #from nncf.torch.engine import NNCFTrainer
 from transformers import TrainingArguments
 from transformers import set_seed
