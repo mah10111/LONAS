@@ -22,8 +22,6 @@ from transformers import AutoTokenizer
 from transformers import GenerationConfig
 from transformers import HfArgumentParser
 from transformers import Trainer
-from nncf.torch.nncf_optim import NNCFTrainer
-#from nncf.torch.engine import NNCFTrainer
 from transformers import TrainingArguments
 from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
@@ -40,20 +38,10 @@ from nncf.torch.model_creation import create_nncf_network
 check_min_version("4.31.0")
 logger = logging.getLogger(__name__)
 TEST_DATASETS = ["boolq", "piqa", "social_i_qa", "winogrande", "ARC-Easy", "ARC-Challenge", "openbookqa", "hellaswag"]
-from typing import Optional
-from dataclasses import field
 
-nncf_config: Optional[str] = field(
-    default=None,
-    metadata={"help": "Path to NNCF config file"}
-)
 
 @dataclass
 class LonasTrainingArguments(TrainingArguments):
-    nncf_config: Optional[str] = field(
-    default=None,
-    metadata={"help": "Path to NNCF config JSON file"}
-            )
     lora_r: int = field(default=32, metadata={"help": "Lora R dimension."})
     lora_alpha: float = field(default=64, metadata={"help": " Lora alpha."})
     lora_dropout: float = field(default=0.0, metadata={"help": "Lora dropout."})
@@ -184,20 +172,12 @@ class ModelArguments:
 
 
 def main():
-    nncf_config_path = None
-    if "--nncf_config" in sys.argv:
-        idx = sys.argv.index("--nncf_config")
-        nncf_config_path = sys.argv[idx + 1]
-      # remove both flag and value so HF parser doesn't see them
-        del sys.argv[idx:idx + 2]
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, LonasTrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
-        #model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-        parsed_args = parser.parse_args_into_dataclasses(return_remaining_strings=True)
-        model_args, data_args, training_args = parsed_args[:3]
-        remaining_args = parsed_args[3]
+        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
@@ -358,24 +338,16 @@ def main():
             eval_dataset = None
 
     # Initialize our Trainer
-    trainer =NNCFTrainer(
-      #  model=model,
-       # args=training_args,
-       # train_dataset=train_dataset if training_args.do_train else None,
-       # eval_dataset=eval_dataset if training_args.do_eval else None,
-        # data_collator=transformers.DataCollatorForSeq2Seq(
-         #   tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
-        #),
-        #compression_ctrl=compression_ctrl,
-      
-         model=model,
-         args=training_args,
-         train_dataset=data["train"],
-         eval_dataset=data["validation"],
-         tokenizer=tokenizer,
-         compression_ctrl=nncf_ctrl
-          )
-    
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset if training_args.do_train else None,
+        eval_dataset=eval_dataset if training_args.do_eval else None,
+        data_collator=transformers.DataCollatorForSeq2Seq(
+            tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+        ),
+        compression_ctrl=compression_ctrl,
+    )
 
     if nncf_config is not None:
         if not (training_args.local_rank in [-1, 0] or training_args.no_cuda):
