@@ -21,8 +21,8 @@ from transformers import AutoModelForCausalLM
 from transformers import AutoTokenizer
 from transformers import GenerationConfig
 from transformers import HfArgumentParser
-#from transformers import Trainer
-from nncf.torch.nncf_optim import NNCFTrainer
+from transformers import Trainer
+#from nncf.torch.engine import NNCFTrainer
 from transformers import TrainingArguments
 from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
