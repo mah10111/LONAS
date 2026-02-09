@@ -222,11 +222,11 @@ def main():
     # load model
     model = AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
-        load_in_8bit=False,
+       # load_in_8bit=False,
+        load_in_4bit=True,
         torch_dtype=torch.float16,
         device_map="auto",
-        trust_remote_code=True,
-        cache_dir=model_args.cache_dir,
+
     )
 
     if training_args.lora and model_args.lora_weights is None:
