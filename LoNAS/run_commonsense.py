@@ -225,10 +225,10 @@ def main():
        # load_in_8bit=False,
         load_in_4bit=True,
         torch_dtype=torch.float16,
-        device_map="auto",
+       # device_map="auto",
 
     )
-
+    model = model.to("cuda")
     if training_args.lora and model_args.lora_weights is None:
         logger.info("adding LoRA modules...")
         config = LoraConfig(
